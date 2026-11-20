@@ -4,9 +4,9 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
-const { TEACHER_CODE, STUDENT_CODE, SECRET } = process.env;
-if (!TEACHER_CODE || !STUDENT_CODE || !SECRET) {
-  console.error('Задайте TEACHER_CODE, STUDENT_CODE, SECRET (см. .env.example)');
+const { TEACHER_CODE, SECRET } = process.env;
+if (!TEACHER_CODE || !SECRET) {
+  console.error('Задайте TEACHER_CODE, SECRET (см. .env.example)');
   process.exit(1);
 }
 const PORT = process.env.PORT || 3001;
@@ -17,10 +17,16 @@ const db = new DatabaseSync(path.join(DATA_DIR, 'homework.db'));
 db.exec('PRAGMA journal_mode = WAL');
 db.exec('PRAGMA foreign_keys = ON');
 db.exec(`
-CREATE TABLE IF NOT EXISTS children(
+CREATE TABLE IF NOT EXISTS classes(
   id INTEGER PRIMARY KEY,
   name TEXT UNIQUE NOT NULL COLLATE NOCASE,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS children(
+  id INTEGER PRIMARY KEY,
+  class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+  name TEXT NOT NULL COLLATE NOCASE,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(class_id, name COLLATE NOCASE));
 CREATE TABLE IF NOT EXISTS works(
   id INTEGER PRIMARY KEY,
   title TEXT NOT NULL,
@@ -29,6 +35,10 @@ CREATE TABLE IF NOT EXISTS works(
   variant_count INTEGER NOT NULL DEFAULT 2 CHECK(variant_count >= 1 AND variant_count <= 10),
   created_by TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS work_classes(
+  work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+  class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+  PRIMARY KEY(work_id, class_id));
 CREATE TABLE IF NOT EXISTS keys(
   work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
   variant INTEGER NOT NULL,
@@ -48,6 +58,56 @@ CREATE TABLE IF NOT EXISTS answers(
   answer TEXT NOT NULL,
   PRIMARY KEY(submission_id, task_no));
 `);
+
+(function migrate() {
+  const childCols = db.prepare('PRAGMA table_info(children)').all();
+  const hasClassId = childCols.some((c) => c.name === 'class_id');
+  if (!hasClassId) {
+    db.exec('ALTER TABLE children ADD COLUMN class_id INTEGER REFERENCES classes(id) ON DELETE CASCADE');
+  }
+  const orphans = db.prepare('SELECT COUNT(*) AS n FROM children WHERE class_id IS NULL').get().n;
+  if (orphans) {
+    let cls = db.prepare('SELECT id FROM classes WHERE name=?').get('Без класса');
+    if (!cls) {
+      const r = db.prepare('INSERT INTO classes(name) VALUES(?)').run('Без класса');
+      cls = { id: Number(r.lastInsertRowid) };
+    }
+    db.prepare('UPDATE children SET class_id=? WHERE class_id IS NULL').run(cls.id);
+  }
+  // убрать старый UNIQUE(name), оставить UNIQUE(class_id, name)
+  const idx = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='children'").get();
+  if (idx?.sql && /name TEXT UNIQUE/i.test(idx.sql)) {
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec(`
+      CREATE TABLE children_new(
+        id INTEGER PRIMARY KEY,
+        class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+        name TEXT NOT NULL COLLATE NOCASE,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(class_id, name COLLATE NOCASE));
+      INSERT INTO children_new(id,class_id,name,created_at)
+        SELECT id, class_id, name, created_at FROM children WHERE class_id IS NOT NULL;
+      DROP TABLE children;
+      ALTER TABLE children_new RENAME TO children;
+    `);
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS children_class_name
+      ON children(class_id, name COLLATE NOCASE)
+  `);
+  const unassigned = db.prepare(`
+    SELECT w.id FROM works w
+    WHERE NOT EXISTS (SELECT 1 FROM work_classes wc WHERE wc.work_id=w.id)
+  `).all();
+  if (unassigned.length) {
+    const classes = db.prepare('SELECT id FROM classes').all();
+    const ins = db.prepare('INSERT OR IGNORE INTO work_classes(work_id,class_id) VALUES(?,?)');
+    for (const w of unassigned) {
+      for (const c of classes) ins.run(w.id, c.id);
+    }
+  }
+})();
 
 function withTx(fn) {
   db.exec('BEGIN');
@@ -78,7 +138,6 @@ const safeEq = (a, b) => {
 function clean(s) { return String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, 80); }
 const titleCase = (s) => clean(s).toLowerCase().replace(/(^|[\s-])(\p{L})/gu, (m, a, b) => a + b.toUpperCase());
 const validDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
-/** Нормализация для сравнения ответов */
 function normAnswer(s) {
   return String(s ?? '')
     .replace(/\s+/g, ' ')
@@ -88,39 +147,99 @@ function normAnswer(s) {
     .replace(/[ё]/g, 'е');
 }
 
+/** teacher.* / student.* / /teacher /student / ?role= */
+function portalFromPath(p) {
+  const path = String(p || '').split('?')[0].replace(/\/+$/, '') || '/';
+  if (path === '/teacher' || path.startsWith('/teacher/')) return 'teacher';
+  if (path === '/student' || path.startsWith('/student/')) return 'student';
+  return null;
+}
+function detectPortal(req) {
+  const host = String(req.hostname || '').toLowerCase();
+  if (host === 'teacher' || host.startsWith('teacher.')) return 'teacher';
+  if (host === 'student' || host.startsWith('student.')) return 'student';
+  const byPath = portalFromPath(req.query?.path) || portalFromPath(req.path);
+  if (byPath) return byPath;
+  const q = String(req.query?.role || '').toLowerCase();
+  if (q === 'teacher' || q === 'student') return q;
+  return null;
+}
+
 const fails = new Map();
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '100kb' }));
 
+app.get('/api/portal', (req, res) => {
+  res.json({ role: detectPortal(req) });
+});
+
+/** Публичный список фамилий для входа ученика */
+app.get('/api/lookup/children', (req, res) => {
+  const q = clean(req.query?.q).toLowerCase();
+  const rows = db.prepare(`
+    SELECT c.id, c.name, cl.name AS class_name
+    FROM children c JOIN classes cl ON cl.id=c.class_id
+    ORDER BY c.name COLLATE NOCASE
+  `).all();
+  // JS toLowerCase — sqlite lower() не умеет кириллицу
+  const filtered = q
+    ? rows.filter((r) => r.name.toLowerCase().startsWith(q))
+    : rows;
+  res.json(filtered.slice(0, 40));
+});
+
 app.post('/api/login', (req, res) => {
+  const portal = detectPortal(req) || portalFromPath(req.body?.path);
   const ip = req.ip;
   const f = fails.get(ip);
   if (f && f.n >= 10 && f.until > Date.now()) {
     return res.status(429).json({ error: 'Слишком много попыток, подождите 10 минут' });
   }
   const { role, secret } = req.body || {};
-  const name = clean(req.body?.name);
-  let ok = false;
-  let who = name;
-  if (role === 'teacher') {
-    ok = name && safeEq(secret, TEACHER_CODE);
-  } else if (role === 'student') {
-    ok = safeEq(secret, STUDENT_CODE);
-    who = 'Ученик';
+  if (portal && role && role !== portal) {
+    return res.status(403).json({ error: 'Неверный портал' });
   }
-  if (!ok) {
-    fails.set(ip, { n: (f?.n || 0) + 1, until: Date.now() + 10 * 60e3 });
-    const err = role === 'teacher'
-      ? (!name ? 'Введите ФИО' : 'НЕВЕРНЫЙ КОД')
-      : 'НЕВЕРНЫЙ КОД';
-    return res.status(401).json({ error: err });
+  const effectiveRole = portal || role;
+  if (effectiveRole === 'teacher') {
+    const name = clean(req.body?.name);
+    if (!name || !safeEq(secret, TEACHER_CODE)) {
+      fails.set(ip, { n: (f?.n || 0) + 1, until: Date.now() + 10 * 60e3 });
+      return res.status(401).json({ error: !name ? 'Введите ФИО' : 'НЕВЕРНЫЙ КОД' });
+    }
+    fails.delete(ip);
+    return res.json({ token: makeToken({ role: 'teacher', name }), role: 'teacher', name });
   }
-  fails.delete(ip);
-  res.json({ token: makeToken({ role, name: who }), role, name: who });
+  if (effectiveRole === 'student') {
+    const childId = parseInt(req.body?.child_id, 10);
+    const child = db.prepare(`
+      SELECT c.id, c.name, c.class_id, cl.name AS class_name
+      FROM children c JOIN classes cl ON cl.id=c.class_id WHERE c.id=?
+    `).get(childId);
+    if (!child) {
+      fails.set(ip, { n: (f?.n || 0) + 1, until: Date.now() + 10 * 60e3 });
+      return res.status(401).json({ error: 'Выберите фамилию из списка' });
+    }
+    fails.delete(ip);
+    return res.json({
+      token: makeToken({
+        role: 'student',
+        name: child.name,
+        childId: child.id,
+        classId: child.class_id,
+      }),
+      role: 'student',
+      name: child.name,
+      childId: child.id,
+      classId: child.class_id,
+      className: child.class_name,
+    });
+  }
+  return res.status(400).json({ error: 'Укажите роль' });
 });
 
 app.use('/api', (req, res, next) => {
+  if (req.path === '/portal' || req.path === '/lookup/children' || req.path === '/login') return next();
   const u = readToken((req.headers.authorization || '').replace('Bearer ', ''));
   if (!u) return res.status(401).json({ error: 'Нужно войти' });
   req.user = u;
@@ -134,20 +253,78 @@ function getWork(id) {
   return db.prepare('SELECT * FROM works WHERE id=?').get(id);
 }
 
-// ---------- Дети ----------
-app.get('/api/children', (req, res) => {
-  const rows = db.prepare('SELECT id, name FROM children ORDER BY name COLLATE NOCASE').all();
+function workClassIds(workId) {
+  return db.prepare('SELECT class_id FROM work_classes WHERE work_id=?').all(workId).map((r) => r.class_id);
+}
+
+function workClasses(workId) {
+  return db.prepare(`
+    SELECT cl.id, cl.name FROM classes cl
+    JOIN work_classes wc ON wc.class_id=cl.id
+    WHERE wc.work_id=?
+    ORDER BY cl.name COLLATE NOCASE
+  `).all(workId);
+}
+
+// ---------- Классы ----------
+app.get('/api/classes', teacherOnly, (req, res) => {
+  const rows = db.prepare(`
+    SELECT cl.*,
+      (SELECT COUNT(*) FROM children ch WHERE ch.class_id=cl.id) AS children_count
+    FROM classes cl
+    ORDER BY cl.name COLLATE NOCASE
+  `).all();
   res.json(rows);
 });
 
-app.post('/api/children', teacherOnly, (req, res) => {
+app.post('/api/classes', teacherOnly, (req, res) => {
+  const name = clean(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Введите название класса' });
+  try {
+    const r = db.prepare('INSERT INTO classes(name) VALUES(?)').run(name);
+    res.json({ id: Number(r.lastInsertRowid), name });
+  } catch {
+    res.status(409).json({ error: 'Такой класс уже есть' });
+  }
+});
+
+app.patch('/api/classes/:id', teacherOnly, (req, res) => {
+  const name = clean(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Введите название' });
+  try {
+    const r = db.prepare('UPDATE classes SET name=? WHERE id=?').run(name, req.params.id);
+    if (!r.changes) return res.status(404).json({ error: 'Не найден' });
+    res.json({ ok: true, name });
+  } catch {
+    res.status(409).json({ error: 'Такой класс уже есть' });
+  }
+});
+
+app.delete('/api/classes/:id', teacherOnly, (req, res) => {
+  const r = db.prepare('DELETE FROM classes WHERE id=?').run(req.params.id);
+  if (!r.changes) return res.status(404).json({ error: 'Не найден' });
+  res.json({ ok: true });
+});
+
+app.get('/api/classes/:id/children', teacherOnly, (req, res) => {
+  const cls = db.prepare('SELECT * FROM classes WHERE id=?').get(req.params.id);
+  if (!cls) return res.status(404).json({ error: 'Класс не найден' });
+  const children = db.prepare(
+    'SELECT id, name FROM children WHERE class_id=? ORDER BY name COLLATE NOCASE'
+  ).all(cls.id);
+  res.json({ class: cls, children });
+});
+
+app.post('/api/classes/:id/children', teacherOnly, (req, res) => {
+  const cls = db.prepare('SELECT id FROM classes WHERE id=?').get(req.params.id);
+  if (!cls) return res.status(404).json({ error: 'Класс не найден' });
   const name = titleCase(req.body?.name);
   if (!name) return res.status(400).json({ error: 'Введите фамилию' });
   try {
-    const r = db.prepare('INSERT INTO children(name) VALUES(?)').run(name);
+    const r = db.prepare('INSERT INTO children(class_id,name) VALUES(?,?)').run(cls.id, name);
     res.json({ id: Number(r.lastInsertRowid), name });
   } catch {
-    res.status(409).json({ error: 'Такая фамилия уже есть' });
+    res.status(409).json({ error: 'Такая фамилия уже есть в классе' });
   }
 });
 
@@ -157,12 +334,46 @@ app.delete('/api/children/:id', teacherOnly, (req, res) => {
   res.json({ ok: true });
 });
 
+/** Все фамилии (учитель) — для подсказок */
+app.get('/api/children', (req, res) => {
+  if (req.user.role === 'student') {
+    return res.json([{ id: req.user.childId, name: req.user.name }]);
+  }
+  const rows = db.prepare(`
+    SELECT c.id, c.name, c.class_id, cl.name AS class_name
+    FROM children c JOIN classes cl ON cl.id=c.class_id
+    ORDER BY cl.name COLLATE NOCASE, c.name COLLATE NOCASE
+  `).all();
+  res.json(rows);
+});
+
 // ---------- Работы ----------
 app.get('/api/works', (req, res) => {
+  if (req.user.role === 'student') {
+    const childId = Number(req.user.childId);
+    const classId = Number(req.user.classId);
+    if (!Number.isFinite(childId) || !Number.isFinite(classId)) {
+      return res.status(401).json({ error: 'Нужно войти заново' });
+    }
+    const rows = db.prepare(`
+      SELECT w.*,
+        (SELECT COUNT(*) FROM submissions s WHERE s.work_id=w.id AND s.child_id=?) AS mine_done
+      FROM works w
+      JOIN work_classes wc ON wc.work_id=w.id AND wc.class_id=?
+      ORDER BY w.date DESC, w.id DESC
+    `).all(childId, classId);
+    return res.json(rows.map((w) => ({
+      ...w,
+      done: !!w.mine_done,
+      mine_done: undefined,
+    })));
+  }
   const rows = db.prepare(`
     SELECT w.*,
       (SELECT COUNT(DISTINCT variant) FROM keys k WHERE k.work_id=w.id) AS keyed_variants,
-      (SELECT COUNT(*) FROM submissions s WHERE s.work_id=w.id) AS submissions
+      (SELECT COUNT(*) FROM submissions s WHERE s.work_id=w.id) AS submissions,
+      (SELECT GROUP_CONCAT(cl.name, ', ') FROM work_classes wc
+         JOIN classes cl ON cl.id=wc.class_id WHERE wc.work_id=w.id) AS class_names
     FROM works w
     ORDER BY w.date DESC, w.id DESC
   `).all();
@@ -174,6 +385,9 @@ app.post('/api/works', teacherOnly, (req, res) => {
   const date = validDate(req.body?.date) ? req.body.date : '';
   const taskCount = parseInt(req.body?.task_count, 10);
   const variantCount = parseInt(req.body?.variant_count ?? 2, 10);
+  let classIds = req.body?.class_ids;
+  if (!Array.isArray(classIds)) classIds = req.body?.class_id != null ? [req.body.class_id] : [];
+  classIds = [...new Set(classIds.map((x) => parseInt(x, 10)).filter((n) => Number.isFinite(n)))];
   if (!title) return res.status(400).json({ error: 'Введите название' });
   if (!date) return res.status(400).json({ error: 'Укажите дату' });
   if (!Number.isFinite(taskCount) || taskCount < 1 || taskCount > 50) {
@@ -182,10 +396,42 @@ app.post('/api/works', teacherOnly, (req, res) => {
   if (!Number.isFinite(variantCount) || variantCount < 1 || variantCount > 10) {
     return res.status(400).json({ error: 'Число вариантов: 1–10' });
   }
-  const r = db.prepare(
-    'INSERT INTO works(title,date,task_count,variant_count,created_by) VALUES(?,?,?,?,?)'
-  ).run(title, date, taskCount, variantCount, req.user.name);
-  res.json({ id: Number(r.lastInsertRowid) });
+  if (!classIds.length) return res.status(400).json({ error: 'Выберите класс' });
+  for (const id of classIds) {
+    if (!db.prepare('SELECT id FROM classes WHERE id=?').get(id)) {
+      return res.status(400).json({ error: 'Класс не найден' });
+    }
+  }
+  let workId;
+  withTx(() => {
+    const r = db.prepare(
+      'INSERT INTO works(title,date,task_count,variant_count,created_by) VALUES(?,?,?,?,?)'
+    ).run(title, date, taskCount, variantCount, req.user.name);
+    workId = Number(r.lastInsertRowid);
+    const ins = db.prepare('INSERT INTO work_classes(work_id,class_id) VALUES(?,?)');
+    for (const id of classIds) ins.run(workId, id);
+  });
+  res.json({ id: workId });
+});
+
+app.put('/api/works/:id/classes', teacherOnly, (req, res) => {
+  const work = getWork(req.params.id);
+  if (!work) return res.status(404).json({ error: 'Работа не найдена' });
+  let classIds = req.body?.class_ids;
+  if (!Array.isArray(classIds)) return res.status(400).json({ error: 'Укажите классы' });
+  classIds = [...new Set(classIds.map((x) => parseInt(x, 10)).filter((n) => Number.isFinite(n)))];
+  if (!classIds.length) return res.status(400).json({ error: 'Выберите класс' });
+  for (const id of classIds) {
+    if (!db.prepare('SELECT id FROM classes WHERE id=?').get(id)) {
+      return res.status(400).json({ error: 'Класс не найден' });
+    }
+  }
+  withTx(() => {
+    db.prepare('DELETE FROM work_classes WHERE work_id=?').run(work.id);
+    const ins = db.prepare('INSERT INTO work_classes(work_id,class_id) VALUES(?,?)');
+    for (const id of classIds) ins.run(work.id, id);
+  });
+  res.json({ ok: true });
 });
 
 app.delete('/api/works/:id', teacherOnly, (req, res) => {
@@ -197,7 +443,13 @@ app.delete('/api/works/:id', teacherOnly, (req, res) => {
 app.get('/api/works/:id', (req, res) => {
   const work = getWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Работа не найдена' });
-  const out = { work };
+  if (req.user.role === 'student') {
+    const ok = db.prepare(
+      'SELECT 1 FROM work_classes WHERE work_id=? AND class_id=?'
+    ).get(work.id, req.user.classId);
+    if (!ok) return res.status(403).json({ error: 'Нет доступа' });
+  }
+  const out = { work, classes: workClasses(work.id) };
   if (req.user.role === 'teacher') {
     const keyRows = db.prepare(
       'SELECT variant, task_no, answer FROM keys WHERE work_id=? ORDER BY variant, task_no'
@@ -212,7 +464,6 @@ app.get('/api/works/:id', (req, res) => {
   res.json(out);
 });
 
-// ---------- Ключ (учитель) ----------
 app.put('/api/works/:id/keys', teacherOnly, (req, res) => {
   const work = getWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Работа не найдена' });
@@ -240,12 +491,18 @@ app.put('/api/works/:id/keys', teacherOnly, (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Сдача ученика ----------
 app.get('/api/works/:id/mine', (req, res) => {
   const work = getWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Работа не найдена' });
-  const childId = parseInt(req.query.child_id, 10);
+  let childId = parseInt(req.query.child_id, 10);
+  if (req.user.role === 'student') childId = req.user.childId;
   if (!childId) return res.status(400).json({ error: 'Укажите ребёнка' });
+  if (req.user.role === 'student') {
+    const ok = db.prepare(
+      'SELECT 1 FROM work_classes WHERE work_id=? AND class_id=?'
+    ).get(work.id, req.user.classId);
+    if (!ok) return res.status(403).json({ error: 'Нет доступа' });
+  }
   const sub = db.prepare(
     'SELECT * FROM submissions WHERE work_id=? AND child_id=?'
   ).get(work.id, childId);
@@ -261,27 +518,36 @@ app.get('/api/works/:id/mine', (req, res) => {
 app.put('/api/works/:id/submit', (req, res) => {
   const work = getWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Работа не найдена' });
-  const childId = parseInt(req.body?.child_id, 10);
+  let childId = parseInt(req.body?.child_id, 10);
+  if (req.user.role === 'student') childId = req.user.childId;
   const variant = parseInt(req.body?.variant, 10);
   const answers = req.body?.answers;
-  const child = db.prepare('SELECT id, name FROM children WHERE id=?').get(childId);
+  const child = db.prepare('SELECT id, name, class_id FROM children WHERE id=?').get(childId);
   if (!child) return res.status(400).json({ error: 'Ребёнок не найден' });
+  if (req.user.role === 'student') {
+    const ok = db.prepare(
+      'SELECT 1 FROM work_classes WHERE work_id=? AND class_id=?'
+    ).get(work.id, child.class_id);
+    if (!ok) return res.status(403).json({ error: 'Нет доступа' });
+  }
   if (!Number.isFinite(variant) || variant < 1 || variant > work.variant_count) {
     return res.status(400).json({ error: 'Неверный вариант' });
   }
   if (!answers || typeof answers !== 'object') {
     return res.status(400).json({ error: 'Нет ответов' });
   }
-  // ученик может сдавать только за себя через student-роль; учитель — за любого
   if (req.user.role !== 'teacher' && req.user.role !== 'student') {
     return res.status(403).json({ error: 'Нет доступа' });
+  }
+  const existing = db.prepare(
+    'SELECT id, submitted_at FROM submissions WHERE work_id=? AND child_id=?'
+  ).get(work.id, childId);
+  if (existing?.submitted_at && req.user.role === 'student') {
+    return res.status(409).json({ error: 'Работа уже сдана, менять ответы нельзя' });
   }
   const now = new Date().toISOString();
   let subId;
   withTx(() => {
-    const existing = db.prepare(
-      'SELECT id FROM submissions WHERE work_id=? AND child_id=?'
-    ).get(work.id, childId);
     if (existing) {
       subId = existing.id;
       db.prepare(
@@ -305,12 +571,19 @@ app.put('/api/works/:id/submit', (req, res) => {
   res.json({ ok: true, submission_id: subId });
 });
 
-// ---------- Матрица сравнения ----------
 app.get('/api/works/:id/matrix', teacherOnly, (req, res) => {
   const work = getWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Работа не найдена' });
 
-  const children = db.prepare('SELECT id, name FROM children ORDER BY name COLLATE NOCASE').all();
+  const classIds = workClassIds(work.id);
+  const children = classIds.length
+    ? db.prepare(`
+        SELECT id, name FROM children
+        WHERE class_id IN (${classIds.map(() => '?').join(',')})
+        ORDER BY name COLLATE NOCASE
+      `).all(...classIds)
+    : [];
+
   const keyRows = db.prepare(
     'SELECT variant, task_no, answer FROM keys WHERE work_id=?'
   ).all(work.id);
@@ -321,7 +594,7 @@ app.get('/api/works/:id/matrix', teacherOnly, (req, res) => {
   }
 
   const subs = db.prepare(
-    'SELECT id, child_id, variant FROM submissions WHERE work_id=?'
+    'SELECT id, child_id, variant FROM submissions WHERE work_id=? AND submitted_at IS NOT NULL'
   ).all(work.id);
   const subByChild = Object.fromEntries(subs.map((s) => [s.child_id, s]));
   const ansBySub = {};
@@ -337,7 +610,7 @@ app.get('/api/works/:id/matrix', teacherOnly, (req, res) => {
   const columns = children.map((ch) => {
     const sub = subByChild[ch.id];
     if (!sub) {
-      return { child_id: ch.id, name: ch.name, variant: null, cells: null };
+      return { child_id: ch.id, name: ch.name, variant: null, submitted: false, cells: null };
     }
     const ans = ansBySub[sub.id] || {};
     const key = keys[sub.variant] || {};
@@ -345,12 +618,13 @@ app.get('/api/works/:id/matrix', teacherOnly, (req, res) => {
     for (let n = 1; n <= work.task_count; n++) {
       const studentA = ans[n];
       if (studentA == null || studentA === '') {
-        cells.push({ task_no: n, status: 'missing', student: null, key: key[n] ?? null });
+        cells.push({ task_no: n, status: 'missed', student: null, key: key[n] ?? null });
         continue;
       }
       const keyA = key[n];
       if (keyA == null || keyA === '') {
-        cells.push({ task_no: n, status: 'no_key', student: studentA, key: null });
+        // без ключа не красим — нейтрально
+        cells.push({ task_no: n, status: 'unchecked', student: studentA, key: null });
         continue;
       }
       const ok = normAnswer(studentA) === normAnswer(keyA);
@@ -361,10 +635,10 @@ app.get('/api/works/:id/matrix', teacherOnly, (req, res) => {
         key: keyA,
       });
     }
-    return { child_id: ch.id, name: ch.name, variant: sub.variant, cells };
+    return { child_id: ch.id, name: ch.name, variant: sub.variant, submitted: true, cells };
   });
 
-  res.json({ work, columns });
+  res.json({ work, classes: workClasses(work.id), columns });
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
