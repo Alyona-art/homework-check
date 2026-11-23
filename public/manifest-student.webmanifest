@@ -1,0 +1,35 @@
+{
+  "id": "/student",
+  "name": "Проверка работ — ученик",
+  "short_name": "Проверка работ",
+  "description": "Кабинет ученика: задания, варианты и сдача домашних работ.",
+  "lang": "ru",
+  "start_url": "/student",
+  "scope": "/student",
+  "display": "standalone",
+  "background_color": "#f3f5f7",
+  "theme_color": "#1b7f5c",
+  "categories": [
+    "education"
+  ],
+  "icons": [
+    {
+      "src": "/icons/student-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/student-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/student-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

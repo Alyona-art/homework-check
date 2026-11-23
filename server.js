@@ -641,9 +641,81 @@ app.get('/api/works/:id/matrix', teacherOnly, (req, res) => {
   res.json({ work, classes: workClasses(work.id), columns });
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+const INDEX_HTML = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
+function loadPwaProfile(manifestFile, icon192, appleIcon) {
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'public', manifestFile), 'utf8')
+  );
+  return {
+    theme: manifest.theme_color,
+    name: manifest.name,
+    shortName: manifest.short_name,
+    title: manifest.name,
+    manifest: '/' + manifestFile,
+    icon192,
+    appleIcon,
+  };
+}
+
+const PWA_PROFILES = {
+  default: loadPwaProfile(
+    'manifest.webmanifest',
+    '/icons/app-192.png',
+    '/icons/app-180.png'
+  ),
+  teacher: loadPwaProfile(
+    'manifest-teacher.webmanifest',
+    '/icons/teacher-192.png',
+    '/icons/teacher-180.png'
+  ),
+  student: loadPwaProfile(
+    'manifest-student.webmanifest',
+    '/icons/student-192.png',
+    '/icons/student-180.png'
+  ),
+};
+
+function pwaProfile(req) {
+  const portal = portalFromPath(req.path);
+  return PWA_PROFILES[portal] || PWA_PROFILES.default;
+}
+
+function renderIndex(req) {
+  const p = pwaProfile(req);
+  return INDEX_HTML
+    .replaceAll('__THEME_COLOR__', p.theme)
+    .replaceAll('__APP_NAME__', p.name)
+    .replaceAll('__APP_SHORT_NAME__', p.shortName)
+    .replaceAll('__PAGE_TITLE__', p.title)
+    .replaceAll('__MANIFEST_HREF__', p.manifest)
+    .replaceAll('__ICON_192__', p.icon192)
+    .replaceAll('__APPLE_ICON__', p.appleIcon);
+}
+
+app.get(
+  ['/manifest.webmanifest', '/manifest-teacher.webmanifest', '/manifest-student.webmanifest'],
+  (req, res) => {
+    res.type('application/manifest+json').set('Cache-Control', 'no-cache');
+    res.sendFile(path.join(__dirname, 'public', path.basename(req.path)));
+  }
+);
+
+app.get('/sw.js', (req, res) => {
+  res.type('application/javascript').set('Cache-Control', 'no-cache');
+  res.sendFile(path.join(__dirname, 'public', 'sw.js'));
+});
+
+app.get('/', (req, res) => {
+  res.set('Cache-Control', 'no-cache').type('html').send(renderIndex(req));
+});
+
+app.get('/index.html', (req, res) => {
+  res.redirect(308, '/');
+});
+
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.set('Cache-Control', 'no-cache').type('html').send(renderIndex(req));
 });
 
 app.listen(PORT, () => console.log(`homework-check http://localhost:${PORT}`));
