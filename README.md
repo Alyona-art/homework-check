@@ -48,7 +48,7 @@ cp .env.example .env
 nano .env   # TEACHER_CODE, SECRET, PORT=3001
 
 set -a && source .env && set +a
-nohup node server.js > /tmp/homework-check.log 2>&1 &
+systemctl restart homework-check.service
 ```
 
 В Caddyfile добавить (если ещё нет):
@@ -76,8 +76,9 @@ scp /tmp/homework-check.tgz root@195.133.199.57:/tmp/
 ssh root@195.133.199.57
 cd /opt/homework-check
 tar xzf /tmp/homework-check.tgz
-# не трогать data/ и .env
-kill $(lsof -t -i:3001) 2>/dev/null || true
+systemctl restart homework-check.service
+systemctl status homework-check.service --no-pager
+curl -fsS http://127.0.0.1:3001/api/portal
 set -a && source .env && set +a
 nohup node server.js > /tmp/homework-check.log 2>&1 &
 exit
