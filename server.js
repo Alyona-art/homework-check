@@ -96,17 +96,6 @@ CREATE TABLE IF NOT EXISTS answers(
     CREATE UNIQUE INDEX IF NOT EXISTS children_class_name
       ON children(class_id, name COLLATE NOCASE)
   `);
-  const unassigned = db.prepare(`
-    SELECT w.id FROM works w
-    WHERE NOT EXISTS (SELECT 1 FROM work_classes wc WHERE wc.work_id=w.id)
-  `).all();
-  if (unassigned.length) {
-    const classes = db.prepare('SELECT id FROM classes').all();
-    const ins = db.prepare('INSERT OR IGNORE INTO work_classes(work_id,class_id) VALUES(?,?)');
-    for (const w of unassigned) {
-      for (const c of classes) ins.run(w.id, c.id);
-    }
-  }
 })();
 
 function withTx(fn) {
@@ -251,10 +240,6 @@ const teacherOnly = (req, res, next) =>
 
 function getWork(id) {
   return db.prepare('SELECT * FROM works WHERE id=?').get(id);
-}
-
-function workClassIds(workId) {
-  return db.prepare('SELECT class_id FROM work_classes WHERE work_id=?').all(workId).map((r) => r.class_id);
 }
 
 function workClasses(workId) {
@@ -417,19 +402,25 @@ app.post('/api/works', teacherOnly, (req, res) => {
 app.put('/api/works/:id/classes', teacherOnly, (req, res) => {
   const work = getWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Работа не найдена' });
-  let classIds = req.body?.class_ids;
-  if (!Array.isArray(classIds)) return res.status(400).json({ error: 'Укажите классы' });
-  classIds = [...new Set(classIds.map((x) => parseInt(x, 10)).filter((n) => Number.isFinite(n)))];
-  if (!classIds.length) return res.status(400).json({ error: 'Выберите класс' });
+  const rawClassIds = req.body?.class_ids;
+  if (!Array.isArray(rawClassIds)) return res.status(400).json({ error: 'Укажите классы' });
+  const parsedIds = rawClassIds.map(Number);
+  if (parsedIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+    return res.status(400).json({ error: 'Неверный класс' });
+  }
+  const classIds = [...new Set(parsedIds)];
   for (const id of classIds) {
     if (!db.prepare('SELECT id FROM classes WHERE id=?').get(id)) {
       return res.status(400).json({ error: 'Класс не найден' });
     }
   }
+  const previousIds = new Set(workClasses(work.id).map((c) => c.id));
+  const nextIds = new Set(classIds);
   withTx(() => {
-    db.prepare('DELETE FROM work_classes WHERE work_id=?').run(work.id);
+    const del = db.prepare('DELETE FROM work_classes WHERE work_id=? AND class_id=?');
     const ins = db.prepare('INSERT INTO work_classes(work_id,class_id) VALUES(?,?)');
-    for (const id of classIds) ins.run(work.id, id);
+    for (const id of previousIds) if (!nextIds.has(id)) del.run(work.id, id);
+    for (const id of nextIds) if (!previousIds.has(id)) ins.run(work.id, id);
   });
   res.json({ ok: true });
 });
@@ -575,14 +566,16 @@ app.get('/api/works/:id/matrix', teacherOnly, (req, res) => {
   const work = getWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Работа не найдена' });
 
-  const classIds = workClassIds(work.id);
-  const children = classIds.length
-    ? db.prepare(`
-        SELECT id, name FROM children
-        WHERE class_id IN (${classIds.map(() => '?').join(',')})
-        ORDER BY name COLLATE NOCASE
-      `).all(...classIds)
-    : [];
+  const classes = workClasses(work.id);
+  const requestedClassId = req.query.class_id == null ? null : Number(req.query.class_id);
+  const selectedClassId = requestedClassId ?? classes[0]?.id ?? null;
+  if (requestedClassId !== null &&
+      (!Number.isSafeInteger(requestedClassId) || !classes.some((c) => c.id === requestedClassId))) {
+    return res.status(400).json({ error: 'Класс не назначен этой работе' });
+  }
+  const children = selectedClassId == null ? [] : db.prepare(`
+    SELECT id, name FROM children WHERE class_id=? ORDER BY name COLLATE NOCASE
+  `).all(selectedClassId);
 
   const keyRows = db.prepare(
     'SELECT variant, task_no, answer FROM keys WHERE work_id=?'
@@ -638,7 +631,7 @@ app.get('/api/works/:id/matrix', teacherOnly, (req, res) => {
     return { child_id: ch.id, name: ch.name, variant: sub.variant, submitted: true, cells };
   });
 
-  res.json({ work, classes: workClasses(work.id), columns });
+  res.json({ work, classes, selected_class_id: selectedClassId, columns });
 });
 
 const INDEX_HTML = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');

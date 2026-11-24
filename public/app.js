@@ -15,6 +15,7 @@ const fmtDate = (iso) => {
 const S = {
   token: null, role: null, name: null, childId: null, classId: null,
   portal: null, view: 'home', workId: null, classViewId: null, variant: 1,
+  matrixClassId: null,
 };
 try { Object.assign(S, JSON.parse(localStorage.getItem('hw') || '{}')); } catch {}
 
@@ -286,6 +287,13 @@ function renderStudentLoginInto(el) {
 }
 
 // ---------- Teacher: classes ----------
+function classChoices(classes, selectedIds, inputName) {
+  return `<div class="class-choices">${classes.map((c) => `
+    <label><input type="checkbox" name="${inputName}" value="${c.id}"
+      ${selectedIds.has(c.id) ? 'checked' : ''}><span>${esc(c.name)} <small>(${c.children_count} уч.)</small></span></label>
+  `).join('')}</div>`;
+}
+
 async function renderTeacherHome() {
   const [works, classes] = await Promise.all([api('/works'), api('/classes')]);
   $app.innerHTML = `<div class="wrap">${topbar('Работы')}<p class="mu">${esc(S.name)}</p>
@@ -297,11 +305,9 @@ async function renderTeacherHome() {
         <div><label class="lbl">Заданий</label><input id="tasks" type="number" min="1" max="50" value="19"></div>
         <div><label class="lbl">Вариантов</label><input id="vars" type="number" min="1" max="10" value="2"></div>
       </div>
-      <label class="lbl" style="margin-top:8px">Класс</label>
+      <label class="lbl" style="margin-top:8px">Классы</label>
       ${classes.length
-        ? `<select id="classId">${classes.map((c) =>
-            `<option value="${c.id}">${esc(c.name)} (${c.children_count})</option>`
-          ).join('')}</select>`
+        ? classChoices(classes, new Set(), 'newClassIds')
         : '<p class="mu">Сначала создайте класс</p>'}
       <button type="button" id="create" style="width:100%;margin-top:10px" ${classes.length ? '' : 'disabled'}>Создать</button>
     </div>
@@ -352,7 +358,7 @@ async function renderTeacherHome() {
         date: document.getElementById('date').value,
         task_count: Number(document.getElementById('tasks').value),
         variant_count: Number(document.getElementById('vars').value),
-        class_ids: [Number(document.getElementById('classId').value)],
+        class_ids: [...document.querySelectorAll('input[name="newClassIds"]:checked')].map((el) => Number(el.value)),
       };
       const r = await api('/works', { method: 'POST', body: JSON.stringify(body) });
       S.workId = r.id; S.view = 'key';
@@ -452,20 +458,98 @@ async function renderClass() {
 
 // ---------- Teacher work ----------
 async function renderTeacherWork() {
-  const data = await api('/works/' + S.workId);
+  const [data, classes] = await Promise.all([api('/works/' + S.workId), api('/classes')]);
   const w = data.work;
   const classNames = (data.classes || []).map((c) => c.name).join(', ') || '—';
+  const assignedIds = new Set((data.classes || []).map((c) => c.id));
   $app.innerHTML = `<div class="wrap">${topbar(w.title, true)}
     <p class="mu">${fmtDate(w.date)} · ${esc(classNames)} · ${w.task_count} заданий · ${w.variant_count} вар.</p>
     <div class="stack">
       <button type="button" id="toKey">Заполнить ответы</button>
       <button type="button" id="toMatrix" class="sec">Результаты</button>
+      <div class="card" style="margin:0">
+        <label class="lbl">Назначенные классы</label>
+        <div class="chip-row" id="assignedClasses">
+          ${(data.classes || []).map((c) => `<span class="chip">${esc(c.name)}
+            <button type="button" data-remove-class="${c.id}" aria-label="Убрать класс ${esc(c.name)}">×</button>
+          </span>`).join('') || '<span class="mu">Классы не назначены</span>'}
+        </div>
+        <div class="suggest-wrap" style="margin:10px 0 0">
+          <input id="classSearch" placeholder="Найти класс и добавить" autocomplete="off" aria-label="Найти класс">
+          <div class="suggest" id="classSuggest" hidden></div>
+        </div>
+        <p class="mu" style="margin:8px 0 0">При удалении всех классов работа исчезнет у учеников, но останется у учителя; сданные ответы сохранятся.</p>
+      </div>
       <button type="button" id="delWork" class="danger">Удалить работу</button>
     </div>
   </div>`;
   bindChrome(() => { S.view = 'home'; render(); });
   document.getElementById('toKey').onclick = () => { S.view = 'key'; render(); };
-  document.getElementById('toMatrix').onclick = () => { S.view = 'matrix'; render(); };
+  document.getElementById('toMatrix').onclick = () => {
+    S.matrixClassId = null;
+    S.view = 'matrix';
+    render();
+  };
+  const classSearch = document.getElementById('classSearch');
+  const classSuggest = document.getElementById('classSuggest');
+  let savingClasses = false;
+  const availableClasses = () => classes.filter((c) => !assignedIds.has(c.id));
+  const showClassSuggestions = () => {
+    const query = classSearch.value.trim().toLowerCase();
+    const matches = availableClasses().filter((c) => c.name.toLowerCase().includes(query));
+    classSuggest.innerHTML = matches.map((c) =>
+      `<button type="button" class="suggest-item" data-add-class="${c.id}">${esc(c.name)}</button>`
+    ).join('') || '<span class="suggest-empty">Класс не найден</span>';
+    classSuggest.hidden = !query || savingClasses;
+  };
+  const updateClasses = async (nextIds, added) => {
+    if (savingClasses) return;
+    savingClasses = true;
+    classSearch.disabled = true;
+    classSuggest.hidden = true;
+    try {
+      await api('/works/' + S.workId + '/classes', {
+        method: 'PUT',
+        body: JSON.stringify({ class_ids: [...nextIds] }),
+      });
+      await renderTeacherWork();
+      if (added) document.getElementById('classSearch')?.focus();
+      toast(added ? 'Класс добавлен' : 'Класс убран');
+    } catch (e) {
+      savingClasses = false;
+      classSearch.disabled = false;
+      toast(e.message);
+    }
+  };
+  classSearch.addEventListener('input', showClassSuggestions);
+  classSearch.addEventListener('focus', showClassSuggestions);
+  classSearch.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') classSuggest.hidden = true;
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    const first = classSuggest.querySelector('[data-add-class]');
+    if (first && !classSuggest.hidden) first.click();
+  });
+  classSuggest.onclick = (e) => {
+    const button = e.target.closest('[data-add-class]');
+    if (!button) return;
+    const id = Number(button.dataset.addClass);
+    updateClasses(new Set([...assignedIds, id]), true);
+  };
+  document.getElementById('assignedClasses').onclick = (e) => {
+    const button = e.target.closest('[data-remove-class]');
+    if (!button) return;
+    const nextIds = new Set(assignedIds);
+    nextIds.delete(Number(button.dataset.removeClass));
+    updateClasses(nextIds, false);
+  };
+  document.addEventListener('click', function closeClassSuggestions(e) {
+    if (!classSearch.isConnected) {
+      document.removeEventListener('click', closeClassSuggestions);
+      return;
+    }
+    if (!e.target.closest('.suggest-wrap')) classSuggest.hidden = true;
+  });
   document.getElementById('delWork').onclick = async () => {
     if (!(await confirmDlg({
       title: 'Удалить работу?',
@@ -557,8 +641,7 @@ function matrixTotals(w, cols) {
   return { perChild, perTask };
 }
 
-function downloadMatrixExcel(w, cols) {
-  const { perChild, perTask } = matrixTotals(w, cols);
+function downloadMatrixExcel(w, classResults, allClasses = false) {
   const enc = new TextEncoder();
   const u16 = (n) => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, n, true); return b; };
   const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
@@ -620,7 +703,7 @@ function downloadMatrixExcel(w, cols) {
   };
   // 0 default, 1 header/tot, 2 match, 3 mismatch, 4 missed, 5 blank
   const styleOf = { match: 2, mismatch: 3, missed: 4, blank: 5, unchecked: 5 };
-  const totCol = cols.length + 1;
+  const totCol = w.task_count + 1;
   const inline = (ref, text, style) => {
     if (text === '' || text == null) return `<c r="${ref}" s="${style}"/>`;
     if (typeof text === 'number') return `<c r="${ref}" s="${style}"><v>${text}</v></c>`;
@@ -630,52 +713,51 @@ function downloadMatrixExcel(w, cols) {
     return `<c r="${ref}" t="inlineStr" s="${style}"><is><t>${xmlEsc(text)}</t></is></c>`;
   };
 
+  const buildSheet = (cols) => {
+  const { perChild, perTask } = matrixTotals(w, cols);
   const sheetRows = [];
   {
-    let cells = inline('A1', '№', 1);
-    cols.forEach((c, i) => {
-      const label = c.name + (c.variant ? ` (в${c.variant})` : '');
-      cells += inline(colLetter(i + 1) + '1', label, 1);
-    });
+    let cells = inline('A1', 'Фамилия', 1);
+    for (let n = 1; n <= w.task_count; n++) cells += inline(colLetter(n) + '1', `Задание ${n}`, 1);
     cells += inline(colLetter(totCol) + '1', 'Верно', 1);
     sheetRows.push(`<row r="1">${cells}</row>`);
   }
-  for (let n = 1; n <= w.task_count; n++) {
-    const r = n + 1;
-    let cells = inline('A' + r, n, 1);
-    cols.forEach((col, i) => {
-      const ref = colLetter(i + 1) + r;
+  cols.forEach((col, i) => {
+    const r = i + 2;
+    let cells = inline(`A${r}`, col.name, 1);
+    for (let n = 1; n <= w.task_count; n++) {
+      const ref = colLetter(n) + r;
       if (!col.cells) cells += inline(ref, '', 5);
       else {
         const cell = col.cells[n - 1];
         const text = cell.student != null ? cell.student : (cell.status === 'missed' ? '—' : '');
         cells += inline(ref, text, styleOf[cell.status] || 5);
       }
-    });
-    cells += inline(colLetter(totCol) + r, perTask[n - 1], 1);
+    }
+    cells += inline(colLetter(totCol) + r, perChild[i] == null ? '' : perChild[i], 1);
     sheetRows.push(`<row r="${r}">${cells}</row>`);
-  }
+  });
   {
-    const r = w.task_count + 2;
-    let cells = inline('A' + r, 'Итого', 1);
-    cols.forEach((_, i) => {
-      const v = perChild[i];
-      cells += inline(colLetter(i + 1) + r, v == null ? '' : v, 1);
+    const r = cols.length + 2;
+    let cells = inline(`A${r}`, 'Итого верно', 1);
+    perTask.forEach((total, i) => {
+      cells += inline(colLetter(i + 1) + r, total, 1);
     });
     cells += inline(colLetter(totCol) + r, '', 1);
     sheetRows.push(`<row r="${r}">${cells}</row>`);
   }
 
-  const colXml = [`<col min="1" max="1" width="8" customWidth="1"/>`]
-    .concat(cols.map((_, i) => `<col min="${i + 2}" max="${i + 2}" width="14" customWidth="1"/>`))
+  const colXml = [`<col min="1" max="1" width="24" customWidth="1"/>`]
+    .concat(Array.from({ length: w.task_count }, (_, i) => `<col min="${i + 2}" max="${i + 2}" width="12" customWidth="1"/>`))
     .concat([`<col min="${totCol + 1}" max="${totCol + 1}" width="10" customWidth="1"/>`])
     .join('');
 
-  const sheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <cols>${colXml}</cols>
   <sheetData>${sheetRows.join('')}</sheetData>
 </worksheet>`;
+  };
 
   const thin = `<left style="thin"/><right style="thin"/><top style="thin"/><bottom style="thin"/>`;
   const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -706,13 +788,26 @@ function downloadMatrixExcel(w, cols) {
   </cellXfs>
 </styleSheet>`;
 
+  const usedSheetNames = new Set();
+  const sheets = classResults.map((result, i) => {
+    const rawName = allClasses ? result.className : 'Результаты';
+    const base = String(rawName || 'Класс').replace(/[\[\]:*?/\\\x00-\x1f]/g, '_')
+      .trim().replace(/^'+|'+$/g, '').trim() || 'Класс';
+    let name = base.slice(0, 31).replace(/'+$/g, '') || 'Класс';
+    for (let n = 2; usedSheetNames.has(name.toLowerCase()); n++) {
+      const suffix = ` (${n})`;
+      name = base.slice(0, 31 - suffix.length) + suffix;
+    }
+    usedSheetNames.add(name.toLowerCase());
+    return { name, xml: buildSheet(result.columns), index: i + 1 };
+  });
   const files = [
     { name: '[Content_Types].xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  ${sheets.map((s) => `<Override PartName="/xl/worksheets/sheet${s.index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('')}
   <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
 </Types>` },
     { name: '_rels/.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -722,14 +817,14 @@ function downloadMatrixExcel(w, cols) {
     { name: 'xl/workbook.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets><sheet name="Результаты" sheetId="1" r:id="rId1"/></sheets>
+  <sheets>${sheets.map((s) => `<sheet name="${xmlEsc(s.name)}" sheetId="${s.index}" r:id="rId${s.index}"/>`).join('')}</sheets>
 </workbook>` },
     { name: 'xl/_rels/workbook.xml.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  ${sheets.map((s) => `<Relationship Id="rId${s.index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${s.index}.xml"/>`).join('')}
+  <Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 </Relationships>` },
-    { name: 'xl/worksheets/sheet1.xml', data: sheet },
+    ...sheets.map((s) => ({ name: `xl/worksheets/sheet${s.index}.xml`, data: s.xml })),
     { name: 'xl/styles.xml', data: styles },
   ];
 
@@ -739,15 +834,18 @@ function downloadMatrixExcel(w, cols) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   const safe = (s) => String(s).replace(/[\\/:*?"<>|]+/g, '_');
-  a.download = `${safe(w.title)}_${safe(w.date)}.xlsx`;
+  a.download = `${safe(w.title)}_${safe(w.date)}${allClasses ? '_все_классы' : classResults.length ? '_' + safe(classResults[0].className) : ''}.xlsx`;
   a.click();
   URL.revokeObjectURL(a.href);
 }
 
 async function renderMatrix() {
-  const data = await api('/works/' + S.workId + '/matrix');
+  const data = await api('/works/' + S.workId + '/matrix' +
+    (S.matrixClassId == null ? '' : '?class_id=' + S.matrixClassId));
   const w = data.work;
   const cols = data.columns;
+  S.matrixClassId = data.selected_class_id;
+  const activeClass = data.classes.find((c) => c.id === data.selected_class_id);
   const { perChild, perTask } = matrixTotals(w, cols);
   const statusLabel = { match: '✓', mismatch: '✗', missed: '—', unchecked: '·' };
 
@@ -774,14 +872,20 @@ async function renderMatrix() {
   body += `<td class="tot"></td></tr>`;
 
   $app.innerHTML = `<div class="wrap">${topbar('Результаты: ' + w.title, true)}
+    ${data.classes.length > 1 ? `<div class="tabs" id="classTabs" role="tablist" aria-label="Класс">
+      ${data.classes.map((c) => `<button type="button" role="tab" data-class-id="${c.id}"
+        aria-selected="${c.id === data.selected_class_id}" class="${c.id === data.selected_class_id ? 'on' : ''}">${esc(c.name)}</button>`).join('')}
+    </div>` : ''}
     <div class="legend">
       <span><i class="swatch match"></i> совпало</span>
       <span><i class="swatch mismatch"></i> не совпало</span>
       <span><i class="swatch missed"></i> не делал</span>
       <span><i class="swatch blank"></i> не сдавал</span>
     </div>
-    ${!cols.length ? '<div class="empty">В назначенных классах нет учеников</div>' : `
-    <button type="button" class="sec" id="xls" style="width:100%;margin-bottom:10px">Скачать в Excel</button>
+    ${!activeClass ? '<div class="empty">Работа не назначена ни одному классу</div>' : `
+    <button type="button" class="sec" id="xls" style="width:100%;margin-bottom:10px">Скачать Excel</button>
+    ${data.classes.length > 1 ? '<button type="button" class="sec" id="xlsAll" style="width:100%;margin-bottom:10px">Скачать все классы</button>' : ''}
+    ${!cols.length ? '<div class="empty">В этом классе нет учеников</div>' : `
     <div class="matrix-wrap">
       <table class="matrix">
         <thead><tr><th class="sticky">№</th>
@@ -792,13 +896,38 @@ async function renderMatrix() {
         </tr></thead>
         <tbody>${body}</tbody>
       </table>
-    </div>`}
+    </div>`}`}
   </div>`;
   bindChrome(() => { S.view = 'work'; render(); });
+  const classTabs = document.getElementById('classTabs');
+  if (classTabs) classTabs.onclick = (e) => {
+    const tab = e.target.closest('[data-class-id]');
+    if (!tab || Number(tab.dataset.classId) === S.matrixClassId) return;
+    S.matrixClassId = Number(tab.dataset.classId);
+    renderMatrix();
+  };
   const xls = document.getElementById('xls');
   if (xls) xls.onclick = () => {
-    downloadMatrixExcel(w, cols);
+    downloadMatrixExcel(w, [{ className: activeClass.name, columns: cols }]);
     toast('Файл скачан');
+  };
+  const xlsAll = document.getElementById('xlsAll');
+  if (xlsAll) xlsAll.onclick = async () => {
+    xlsAll.disabled = true;
+    xlsAll.textContent = 'Готовим Excel…';
+    try {
+      const results = await Promise.all(data.classes.map(async (c) => ({
+        className: c.name,
+        columns: c.id === data.selected_class_id ? cols :
+          (await api('/works/' + S.workId + '/matrix?class_id=' + c.id)).columns,
+      })));
+      downloadMatrixExcel(w, results, true);
+      toast('Файл скачан');
+    } catch (e) { toast(e.message); }
+    finally {
+      xlsAll.disabled = false;
+      xlsAll.textContent = 'Скачать все классы';
+    }
   };
 }
 
